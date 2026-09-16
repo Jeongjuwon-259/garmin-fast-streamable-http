@@ -15,6 +15,7 @@ def register_tools(mcp: FastMCP):
         workout,
         gear,
         tcx,
+        condition,
     )
 
     activities.register(mcp)
@@ -26,3 +27,4 @@ def register_tools(mcp: FastMCP):
     workout.register(mcp)
     gear.register(mcp)
     tcx.register(mcp)
+    condition.register(mcp)
