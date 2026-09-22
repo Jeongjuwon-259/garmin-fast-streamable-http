@@ -1,6 +1,7 @@
 """Garmin Running MCP Server."""
 
 import os
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
@@ -19,6 +20,27 @@ def get_client() -> GarminClient:
         garmin = create_client()
         _client = GarminClient(garmin)
     return _client
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Liveness/readiness probe for streamable-http deployments.
+
+    Deliberately does NOT touch Garmin (no login, no API call) — this is a
+    fast "is the process up and serving requests" check, not a check that
+    Garmin auth is valid. It also does not require auth itself, so it's
+    safe to leave open even behind an auth-gated deployment.
+    """
+    from starlette.responses import JSONResponse
+
+    from garmin_mcp.auth import _has_saved_tokens
+
+    return JSONResponse({
+        "status": "ok",
+        "server": "garmin-mcp",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "garmin_tokens_present": _has_saved_tokens(),
+    })
 
 
 # Register all tools
