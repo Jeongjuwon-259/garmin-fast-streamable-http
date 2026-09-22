@@ -1,5 +1,7 @@
 """Garmin Running MCP Server."""
 
+import os
+
 from mcp.server.fastmcp import FastMCP
 
 from garmin_mcp.auth import create_client
@@ -26,5 +28,41 @@ register_tools(mcp)
 
 
 def main():
-    """Run the MCP server."""
-    mcp.run(transport="stdio")
+    """Run the MCP server.
+
+    Transport defaults to stdio (local, spawned by Claude Desktop as a
+    subprocess) so existing local setups keep working unchanged.
+
+    Set MCP_TRANSPORT=streamable-http to run as a standalone HTTP server
+    instead (needed for remote/cloud hosting so it can be reached from
+    other devices). MCP_HOST/MCP_PORT configure the listen address
+    (defaults 0.0.0.0:8000).
+
+    SECURITY: streamable-http mode has no authentication in front of it.
+    Anyone who can reach the port can call every tool, including ones that
+    read your Garmin account. Do not expose this port on the public
+    internet without adding an auth layer (reverse proxy with a bearer
+    token, mcp's built-in AuthSettings, etc.) first.
+    """
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        mcp.settings.host = host
+        mcp.settings.port = port
+
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            # FastMCP auto-enables DNS-rebinding protection scoped to
+            # localhost only when constructed with a localhost host. Since
+            # we're changing the host after construction for a non-local
+            # bind, relax that check too (still no auth — see docstring).
+            from mcp.server.fastmcp.server import TransportSecuritySettings
+
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
+
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run(transport="stdio")
