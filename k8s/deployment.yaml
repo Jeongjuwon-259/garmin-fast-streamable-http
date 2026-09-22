@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garmin-mcp
+  namespace: garmin
+  labels:
+    app: garmin-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garmin-mcp
+  template:
+    metadata:
+      labels:
+        app: garmin-mcp
+    spec:
+      containers:
+        - name: garmin-mcp
+          image: garmin-mcp:latest
+          imagePullPolicy: Never  # 로컬 빌드 이미지 — node-1/node-2 양쪽에 전송/load 되어 있어 스케줄링 제약 불필요
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: MCP_TRANSPORT
+              value: "streamable-http"
+            - name: MCP_HOST
+              value: "0.0.0.0"
+            - name: MCP_PORT
+              value: "8000"
+            - name: GARMIN_TOKEN_DIR
+              value: "/root/.garminconnect"
+            - name: GARMINTOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: garmin-tokens
+                  key: GARMINTOKENS
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

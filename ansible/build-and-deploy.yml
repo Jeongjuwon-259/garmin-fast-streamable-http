@@ -1,0 +1,232 @@
+---
+# ansible/build-and-deploy.yml
+# garmin-fast-streamable-http 이미지를 node-1에서 빌드 → node-2로 전송 →
+# control-plane(node-1)에서 k8s manifest 적용까지 한 번에 수행.
+#
+# 실행 (이 저장소 루트에서):
+#   cd ansible
+#   ansible-playbook build-and-deploy.yml -i inventory/hosts.ini --ask-become-pass
+#
+# 전제:
+# - node-1(control-plane)=192.168.0.201, node-2(worker)=192.168.0.202
+# - garmin-tokens Secret은 별도로 미리 생성되어 있어야 함 (../k8s/SECRET_SETUP.md 참고)
+# - k8s/ 매니페스트가 이 저장소에 포함되어 있음 (namespace, deployment, service, httproute)
+
+- name: Build garmin-mcp:latest Docker image on node-1
+  hosts: node-1
+  become: yes
+  gather_facts: no
+  vars:
+    build_dir: /opt/garmin-mcp
+    local_source_dir: "{{ playbook_dir }}/.."
+    tarball_path: /tmp/garmin-mcp-latest.tar
+
+  tasks:
+    - name: Remove existing garmin-mcp:latest image on node-1 (clean rebuild)
+      ansible.builtin.command:
+        cmd: docker rmi -f garmin-mcp:latest
+      register: rmi_result
+      failed_when: false
+      changed_when: "'No such image' not in rmi_result.stderr"
+
+    - name: Ensure build directory exists
+      ansible.builtin.file:
+        path: "{{ build_dir }}"
+        state: directory
+        owner: admin
+        group: admin
+        mode: "0755"
+
+    - name: Copy source code to node-1 (.dockerignore 적용된 항목 제외하고 동일하게)
+      ansible.builtin.copy:
+        src: "{{ local_source_dir }}/"
+        dest: "{{ build_dir }}/"
+        owner: admin
+        group: admin
+        mode: preserve
+
+    - name: Build garmin-mcp Docker image
+      ansible.builtin.command:
+        cmd: docker build -t garmin-mcp:latest {{ build_dir }}
+      register: build_result
+      changed_when: build_result.rc == 0
+      timeout: 600
+
+    - name: Show build result
+      ansible.builtin.debug:
+        var: build_result.stdout_lines
+
+    - name: Verify garmin-mcp image on node-1
+      ansible.builtin.command: docker images garmin-mcp
+      register: image_result
+      changed_when: false
+
+    - name: Show final image on node-1
+      ansible.builtin.debug:
+        var: image_result.stdout
+
+    - name: Save garmin-mcp image to tarball on node-1
+      ansible.builtin.command:
+        cmd: docker save garmin-mcp:latest -o {{ tarball_path }}
+      register: save_result
+      changed_when: save_result.rc == 0
+
+    - name: Fix tarball ownership for scp
+      ansible.builtin.file:
+        path: "{{ tarball_path }}"
+        owner: admin
+        group: admin
+        mode: "0644"
+
+- name: Transfer tarball node-1 -> controller -> node-2
+  hosts: localhost
+  gather_facts: no
+  connection: local
+  vars:
+    tarball_path: /tmp/garmin-mcp-latest.tar
+    local_tarball_path: /tmp/garmin-mcp-latest.tar
+
+  tasks:
+    - name: Download tarball from node-1 to controller (scp)
+      ansible.builtin.shell:
+        cmd: >
+          sshpass -p 'admin' scp -o StrictHostKeyChecking=no
+          admin@192.168.0.201:{{ tarball_path }} {{ local_tarball_path }}
+      register: scp_download
+      changed_when: scp_download.rc == 0
+
+    - name: Upload tarball from controller to node-2 (scp)
+      ansible.builtin.shell:
+        cmd: >
+          sshpass -p 'admin' scp -o StrictHostKeyChecking=no
+          {{ local_tarball_path }} admin@192.168.0.202:{{ tarball_path }}
+      register: scp_upload
+      changed_when: scp_upload.rc == 0
+
+    - name: Cleanup local tarball on controller
+      ansible.builtin.file:
+        path: "{{ local_tarball_path }}"
+        state: absent
+
+- name: Load garmin-mcp image on node-2
+  hosts: node-2
+  become: yes
+  gather_facts: no
+  vars:
+    tarball_path: /tmp/garmin-mcp-latest.tar
+
+  tasks:
+    - name: Remove existing garmin-mcp:latest image on node-2 (clean load)
+      ansible.builtin.command:
+        cmd: docker rmi -f garmin-mcp:latest
+      register: rmi_result
+      failed_when: false
+      changed_when: "'No such image' not in rmi_result.stderr"
+
+    - name: Load garmin-mcp image on node-2
+      ansible.builtin.command:
+        cmd: docker load -i {{ tarball_path }}
+      register: load_result
+      changed_when: load_result.rc == 0
+      timeout: 120
+
+    - name: Verify garmin-mcp image on node-2
+      ansible.builtin.command: docker images garmin-mcp
+      register: image_result
+      changed_when: false
+
+    - name: Show final image on node-2
+      ansible.builtin.debug:
+        var: image_result.stdout
+
+    - name: Cleanup tarball on node-2
+      ansible.builtin.file:
+        path: "{{ tarball_path }}"
+        state: absent
+
+- name: Cleanup build tarball on node-1
+  hosts: node-1
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Remove tarball
+      ansible.builtin.file:
+        path: /tmp/garmin-mcp-latest.tar
+        state: absent
+
+- name: Apply K8s manifests on control-plane
+  hosts: node-1
+  become: yes
+  gather_facts: no
+  vars:
+    k8s_dir: "{{ playbook_dir }}/../k8s"
+
+  tasks:
+    - name: Copy k8s manifests to node-1
+      ansible.builtin.copy:
+        src: "{{ k8s_dir }}/"
+        dest: /tmp/garmin-mcp-k8s/
+        mode: "0644"
+
+    - name: Apply namespace
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/garmin-mcp-k8s/namespace.yaml
+      register: ns_apply
+      changed_when: "'unchanged' not in ns_apply.stdout"
+
+    - name: Check garmin-tokens Secret exists (SECRET_SETUP.md 먼저 실행 필요)
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n garmin get secret garmin-tokens
+      register: secret_check
+      failed_when: false
+      changed_when: false
+
+    - name: Warn if garmin-tokens Secret missing
+      ansible.builtin.debug:
+        msg: >
+          WARNING: garmin-tokens Secret이 없습니다. Pod가 CrashLoopBackOff 상태가 될 수 있습니다.
+          ../k8s/SECRET_SETUP.md 를 참고해 먼저 Secret을 생성하세요.
+      when: secret_check.rc != 0
+
+    - name: Apply Deployment
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/garmin-mcp-k8s/deployment.yaml
+      register: deploy_apply
+
+    - name: Apply Service
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/garmin-mcp-k8s/service.yaml
+      register: svc_apply
+
+    - name: Apply HTTPRoute
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/garmin-mcp-k8s/httproute.yaml
+      register: route_apply
+      failed_when: false
+
+    - name: Show apply results
+      ansible.builtin.debug:
+        msg:
+          - "{{ deploy_apply.stdout }}"
+          - "{{ svc_apply.stdout }}"
+          - "{{ route_apply.stdout | default('HTTPRoute skipped/failed') }}"
+
+    - name: Wait for rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n garmin rollout status deployment/garmin-mcp --timeout=90s
+      register: rollout_status
+      failed_when: false
+
+    - name: Show rollout status
+      ansible.builtin.debug:
+        var: rollout_status.stdout_lines
+
+    - name: Show pod status
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n garmin get pods -o wide
+      register: pod_status
+      changed_when: false
+
+    - name: Show pod status output
+      ansible.builtin.debug:
+        var: pod_status.stdout_lines
